@@ -10,7 +10,7 @@ import logging
 
 from scapy.all import *
 
-from lib.redisopt import conn, content_deal
+from lib.mongo import mongo_insert
 from lib.out import error
 from lib import config
 
@@ -33,7 +33,7 @@ def extract(data, out):
             uri = "http://%s%s" % (host, url)
             if out == 'true':
                 print_request(method, host, url)
-            content_deal(headers, host, method, postdata='', uri=uri, packet=data)
+            mongo_insert(headers, host, method, postdata='', uri=uri, packet=data) # 存入数据库
 
         elif method == 'POST':
             body = data.split('\r\n\r\n')[1]
@@ -45,7 +45,7 @@ def extract(data, out):
             uri = "http://%s%s" % (host, url)
             if out == 'true':
                 print_request(method, host, url)
-            content_deal(headers, host, method, postdata=body, uri=uri, packet=data)
+            mongo_insert(headers, host, method, postdata=body, uri=uri, packet=data)
 
     except Exception, e:
         if 'url' in dir() and "method" in dir():

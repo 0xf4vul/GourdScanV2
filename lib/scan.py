@@ -1,27 +1,30 @@
-#coding=utf-8
+# coding=utf-8
 
 import re
 import json
 import time
-import base64
 import requests
 import urlparse
 import threading
-
 from xml.dom import minidom
-from base64 import decodestring as ds
-
 from lib import out
 from lib import config
-from lib.redisopt import conn
+from lib.enums import *
+from lib.mongo import ReqItem
 
 '''
-All those scan funcs and threads controll
+All those scan funcs and threads control
 '''
 
 
+# TODO 这一步应该在内存中控制变量判断而不是在数据库中
 def thread_filled():
-    running_length = conn.llen("running")
+    """
+    判断线程池是否已满
+
+    :return: True or False
+    """
+    running_length = ReqItem.status_count(ITEM_STATUS.RUNNING)
     if running_length < int(config.load()['threads_num']):
         return False
     else:
@@ -36,7 +39,7 @@ def time_requests(method, url, headers, postdata=""):
         else:
             res = requests.get(url=url, headers=headers)
         time1 = time.time()
-        return res.content, time1-time0
+        return res.content, time1 - time0
     except:
         return "Error", 0
 
@@ -73,28 +76,37 @@ def requests_convert(request):
 def scan_start():
     while config.load()['scan_stat'].lower() == "true":
         try:
+            # TODO 这两个sleep没有必要
             while thread_filled():
                 time.sleep(5)
-            reqhash = conn.rpoplpush("waiting", "running")
+
+            # 取出一个等待的任务, 并将其标记为运行中
+            item = ReqItem()
+            item.set_status(ITEM_STATUS.RUNNING)
+
+            reqhash = item.data_obj['hash']
             if not reqhash:
                 time.sleep(10)
                 continue
-            reqed = conn.hget("request", reqhash)
-            request = json.loads(ds(reqed))
+
+            request = item.data_obj['request']  # TODO 检查request值
             rules = config.load_rule()['scan_type']
             url = urlparse.urlparse(request['url']).query
-            if (request['method'] == "GET" and url != "") or (request['method'] == "POST" and (request["postdata"] != "" or url != "")):
-                t = threading.Thread(target=new_scan, args=(reqhash, requests_convert(request), rules))
+
+            if (request['method'] == "GET" and url != "") or (
+                            request['method'] == "POST" and (request["postdata"] != "" or url != "")):
+                t = threading.Thread(target=new_scan, args=(reqhash, item, rules))
                 t.start()
-            else:
-                conn.lrem("running", 1, reqhash)
-                conn.lpush("finished", reqhash)
-        except Exception,e:
+            else:  # 不合规的任务直接标记为finished
+                item.set_status(ITEM_STATUS.FINISHED)
+
+        except Exception, e:
             out.error(str(e))
     return
 
 
-def new_scan(reqhash, request, rules):
+def new_scan(reqhash, item, rules):
+    request = requests_convert(item.data_obj['request'])
     out.good("start new mission: %s" % reqhash)
     request_stat = 0
     request_message = []
@@ -110,10 +122,9 @@ def new_scan(reqhash, request, rules):
             request_result[rule] = {"stat": request_stat, "message": request_message}
     request_result['stat'] = vulnerable
     if vulnerable > 0:
-        conn.lpush("vulnerable", reqhash)
-    conn.hset("results", reqhash, base64.b64encode(json.dumps(request_result)))
-    conn.lrem("running", 1, reqhash)
-    conn.lpush("finished", reqhash)
+        item.mark_vulnerable()  # 标记为存在漏洞
+    item.set_result(request_result)  # 响应数据入库
+    item.set_status(ITEM_STATUS.FINISHED)  # 更新任务状态
 
 
 def common_scan(request, config_level, re_test, scan_type):
@@ -126,18 +137,23 @@ def common_scan(request, config_level, re_test, scan_type):
             for payload in payloads.splitlines():
                 for param_name in urlparse.urlparse(request['url']).query.split("&"):
                     response = request_payload(request, payload.strip(), param_name)
-                    for response_rule in node.getElementsByTagName('responses')[0].childNodes[0].nodeValue.strip().splitlines():
+                    for response_rule in node.getElementsByTagName('responses')[0].childNodes[
+                        0].nodeValue.strip().splitlines():
                         if re_test:
                             if re.search(response_rule.strip().encode("utf-8"), response):
                                 message['request_stat'] = 3
-                                message['message'] += "payload: %s|#|param: %s|#|findstr: %s|,|" % (payload.strip().encode('utf-8'), param_name.split("=")[0], response_rule.strip().encode('utf-8'))
+                                message['message'] += "payload: %s|#|param: %s|#|findstr: %s|,|" % (
+                                    payload.strip().encode('utf-8'), param_name.split("=")[0],
+                                    response_rule.strip().encode('utf-8'))
                                 if config.load()['only_one_match'].lower() == "true":
                                     return message
                         else:
                             if response_rule.strip().encode("utf-8") in response:
-                            #rule format: unicode, it need to be encoded with utf-8
+                                # rule format: unicode, it need to be encoded with utf-8
                                 message['request_stat'] = 3
-                                message['message'] += "payload: %s|#|param: %s|#|findstr: %s|,|" % (payload.strip().encode('utf-8'), param_name.split("=")[0], response_rule.strip().encode('utf-8'))
+                                message['message'] += "payload: %s|#|param: %s|#|findstr: %s|,|" % (
+                                    payload.strip().encode('utf-8'), param_name.split("=")[0],
+                                    response_rule.strip().encode('utf-8'))
                                 if config.load()['only_one_match'].lower() == "true":
                                     return message
                 for param_name in request['postdata'].split("&"):
@@ -145,18 +161,23 @@ def common_scan(request, config_level, re_test, scan_type):
                         break
                     else:
                         response = request_payload(request, payload.strip(), param_name, postdata=True)
-                    for response_rule in node.getElementsByTagName('responses')[0].childNodes[0].nodeValue.strip().splitlines():
+                    for response_rule in node.getElementsByTagName('responses')[0].childNodes[
+                        0].nodeValue.strip().splitlines():
                         if re_test:
                             if re.search(response_rule.strip().encode("utf-8"), response):
                                 message['request_stat'] = 3
-                                message['message'] += "payload: %s|#|param: %s|#|findstr: %s|,|" % (payload.strip().encode('utf-8'), param_name.split("=")[0], response_rule.strip().encode('utf-8'))
+                                message['message'] += "payload: %s|#|param: %s|#|findstr: %s|,|" % (
+                                    payload.strip().encode('utf-8'), param_name.split("=")[0],
+                                    response_rule.strip().encode('utf-8'))
                                 if config.load()['only_one_match'].lower() == "true":
                                     return message
                         else:
                             if response_rule.strip().encode("utf-8") in response:
-                            #rule format: unicode, it need to be encoded with utf-8
+                                # rule format: unicode, it need to be encoded with utf-8
                                 message['request_stat'] = 3
-                                message['message'] += "payload: %s|#|param: %s|#|findstr: %s|,|" % (payload.strip().encode('utf-8'), param_name.split("=")[0], response_rule.strip().encode('utf-8'))
+                                message['message'] += "payload: %s|#|param: %s|#|findstr: %s|,|" % (
+                                    payload.strip().encode('utf-8'), param_name.split("=")[0],
+                                    response_rule.strip().encode('utf-8'))
                                 if config.load()['only_one_match'].lower() == "true":
                                     return message
     return message
@@ -194,7 +215,8 @@ def xss_scan(request, config_level):
                     response = request_payload(request, payload.strip(), param_name)
                     if payload.strip().encode("utf-8") in response:
                         message['request_stat'] = 1
-                        message['message'] += "payload: %s|#|param: %s|#|findstr: %s|,|" % (payload.strip().encode('utf-8'), param_name.split("=")[0], payload.strip().encode('utf-8'))
+                        message['message'] += "payload: %s|#|param: %s|#|findstr: %s|,|" % (
+                            payload.strip().encode('utf-8'), param_name.split("=")[0], payload.strip().encode('utf-8'))
                         if config.load()['only_one_match'].lower() == "true":
                             return message
                 for param_name in request['postdata'].split("&"):
@@ -204,7 +226,8 @@ def xss_scan(request, config_level):
                         response = request_payload(request, payload.strip(), param_name, postdata=True)
                     if payload.strip().encode("utf-8") in response:
                         message['request_stat'] = 1
-                        message['message'] += "payload: %s|#|param: %s|#|findstr: %s|,|" % (payload.strip().encode('utf-8'), param_name.split("=")[0], payload.strip().encode('utf-8'))
+                        message['message'] += "payload: %s|#|param: %s|#|findstr: %s|,|" % (
+                            payload.strip().encode('utf-8'), param_name.split("=")[0], payload.strip().encode('utf-8'))
                         if config.load()['only_one_match'].lower() == "true":
                             return message
     return message
@@ -225,11 +248,12 @@ def sqlibool_scan(request, config_level):
                     response1 = request_payload(request, compare1, param_name)
                     response2 = request_payload(request, compare2, param_name)
                     response22 = request_payload(request, compare22, param_name)
-                    time.sleep(1)#prevent time stamp in response
+                    time.sleep(1)  # prevent time stamp in response
                     response11 = request_payload(request, compare11, param_name)
                     if response1 == response11 and response2 == response22 and response1 != response2:
                         message['request_stat'] = 2
-                        message['message'] += "payload1: %s|#|payload2: %s|#|param: %s|,|" % (compare1.encode('utf-8'), compare2.encode('utf-8'), param_name.split("=")[0])
+                        message['message'] += "payload1: %s|#|payload2: %s|#|param: %s|,|" % (
+                            compare1.encode('utf-8'), compare2.encode('utf-8'), param_name.split("=")[0])
                         if config.load()['only_one_match'].lower() == "true":
                             return message
                 for param_name in request['postdata'].split("&"):
@@ -241,7 +265,8 @@ def sqlibool_scan(request, config_level):
                     response22 = request_payload(request, compare22, param_name, postdata=True)
                     if response1 == response11 and response2 == response22 and response1 != response2:
                         message['request_stat'] = 2
-                        message['message'] += "payload1: %s|#|payload2: %s|#|param: %s|,|" % (compare1.encode('utf-8'), compare2.encode('utf-8'), param_name.split("=")[0])
+                        message['message'] += "payload1: %s|#|payload2: %s|#|param: %s|,|" % (
+                            compare1.encode('utf-8'), compare2.encode('utf-8'), param_name.split("=")[0])
                         if config.load()['only_one_match'].lower() == "true":
                             return message
     return message
@@ -257,42 +282,56 @@ def sqlitime_scan(request, config_level):
             for payload in payloads.splitlines():
                 if "TIME_VAR" in payload:
                     for param_name in urlparse.urlparse(request['url']).query.split("&"):
-                        response, time0 = request_payload(request, payload.strip().replace("TIME_VAR", "0"), param_name, time_check=True)
-                        response, time3 = request_payload(request, payload.strip().replace("TIME_VAR", "3"), param_name, time_check=True)
+                        response, time0 = request_payload(request, payload.strip().replace("TIME_VAR", "0"), param_name,
+                                                          time_check=True)
+                        response, time3 = request_payload(request, payload.strip().replace("TIME_VAR", "3"), param_name,
+                                                          time_check=True)
                         if time3 - time0 >= 2:
-                            response, time6 = request_payload(request, payload.strip().replace("TIME_VAR", "6"), param_name, time_check=True)
+                            response, time6 = request_payload(request, payload.strip().replace("TIME_VAR", "6"),
+                                                              param_name, time_check=True)
                             num = (time6 - time0) / (time3 - time0)
                             if num <= 2.3 and num >= 1.7:
                                 message['request_stat'] = 3
-                                message['message'] += "payload: %s|#|param: %s|,|" % (payload.strip().replace("TIME_VAR", '5').encode('utf-8'), param_name.split("=")[0])
+                                message['message'] += "payload: %s|#|param: %s|,|" % (
+                                    payload.strip().replace("TIME_VAR", '5').encode('utf-8'), param_name.split("=")[0])
                                 if config.load()['only_one_match'].lower() == "true":
                                     return message
                     for param_name in request['postdata'].split("&"):
                         if request['postdata'] == "":
                             break
-                        response, time0 = request_payload(request, payload.strip().replace("TIME_VAR", "0"), param_name, postdata=True, time_check=True)
-                        response, time3 = request_payload(request, payload.strip().replace("TIME_VAR", "3"), param_name, postdata=True, time_check=True)
+                        response, time0 = request_payload(request, payload.strip().replace("TIME_VAR", "0"), param_name,
+                                                          postdata=True, time_check=True)
+                        response, time3 = request_payload(request, payload.strip().replace("TIME_VAR", "3"), param_name,
+                                                          postdata=True, time_check=True)
                         if time3 - time0 >= 2:
-                            response, time6 = request_payload(request, payload.strip().replace("TIME_VAR", "6"), param_name, postdata=True, time_check=True)
+                            response, time6 = request_payload(request, payload.strip().replace("TIME_VAR", "6"),
+                                                              param_name, postdata=True, time_check=True)
                             num = (time6 - time0) / (time3 - time0)
                             if num <= 2.3 and num >= 1.7:
                                 message['request_stat'] = 3
-                                message['message'] += "payload: %s|#|param: %s|,|" % (payload.strip().replace("TIME_VAR", '5').encode('utf-8'), param_name.split("=")[0])
+                                message['message'] += "payload: %s|#|param: %s|,|" % (
+                                    payload.strip().replace("TIME_VAR", '5').encode('utf-8'), param_name.split("=")[0])
                                 if config.load()['only_one_match'].lower() == "true":
                                     return message
                 elif "NUM_VAR" in payload:
                     for param_name in urlparse.urlparse(request['url']).query.split("&"):
-                        response, time0 = request_payload(request, payload.strip().replace("NUM_VAR", "0"), param_name, time_check=True)
+                        response, time0 = request_payload(request, payload.strip().replace("NUM_VAR", "0"), param_name,
+                                                          time_check=True)
                         VAR = '500000'
                         for NUM_VAR in range(3):
                             VAR += '0'
-                            response, time_more = request_payload(request, payload.strip().replace("NUM_VAR", VAR), param_name, time_check=True)
+                            response, time_more = request_payload(request, payload.strip().replace("NUM_VAR", VAR),
+                                                                  param_name, time_check=True)
                             if time_more - time0 >= 3:
-                                response, time6 = request_payload(request, payload.strip().replace("NUM_VAR", str(int(VAR) * 2)), param_name, time_check=True)
+                                response, time6 = request_payload(request,
+                                                                  payload.strip().replace("NUM_VAR", str(int(VAR) * 2)),
+                                                                  param_name, time_check=True)
                                 num = (time6 - time0) / (time_more - time0)
                                 if num <= 2.3 and num >= 1.7:
                                     message['request_stat'] = 3
-                                    message['message'] += "payload: %s|#|param: %s|,|" % (payload.strip().replace("NUM_VAR", VAR).encode('utf-8'), param_name.split("=")[0])
+                                    message['message'] += "payload: %s|#|param: %s|,|" % (
+                                        payload.strip().replace("NUM_VAR", VAR).encode('utf-8'),
+                                        param_name.split("=")[0])
                                     if config.load()['only_one_match'].lower() == "true":
                                         return message
                                     else:
@@ -302,17 +341,23 @@ def sqlitime_scan(request, config_level):
                     for param_name in request['postdata'].split("&"):
                         if request['postdata'] == "":
                             break
-                        response, time0 = request_payload(request, payload.strip().replace("NUM_VAR", "0"), param_name, time_check=True)
+                        response, time0 = request_payload(request, payload.strip().replace("NUM_VAR", "0"), param_name,
+                                                          time_check=True)
                         VAR = '500000'
                         for NUM_VAR in range(3):
                             VAR += '0'
-                            response, time_more = request_payload(request, payload.strip().replace("NUM_VAR", VAR), param_name, postdata=True, time_check=True)
+                            response, time_more = request_payload(request, payload.strip().replace("NUM_VAR", VAR),
+                                                                  param_name, postdata=True, time_check=True)
                             if time_more - time0 >= 3:
-                                response, time6 = request_payload(request, payload.strip().replace("NUM_VAR", str(int(VAR) * 2)), param_name, postdata=True, time_check=True)
+                                response, time6 = request_payload(request,
+                                                                  payload.strip().replace("NUM_VAR", str(int(VAR) * 2)),
+                                                                  param_name, postdata=True, time_check=True)
                                 num = (time6 - time0) / (time_more - time0)
                                 if num <= 2.3 and num >= 1.7:
                                     message['request_stat'] = 3
-                                    message['message'] += "payload: %s|#|param: %s|,|" % (payload.strip().replace("NUM_VAR", VAR).encode('utf-8'), param_name.split("=")[0])
+                                    message['message'] += "payload: %s|#|param: %s|,|" % (
+                                        payload.strip().replace("NUM_VAR", VAR).encode('utf-8'),
+                                        param_name.split("=")[0])
                                     if config.load()['only_one_match'].lower() == "true":
                                         return message
                                     else:
@@ -346,7 +391,8 @@ def sqlmap_scan(request, level):
         data = json.loads(requests.get("%s/scan/%s/data" % (sqlmap_api, taskid)).content)['data']
         if data != []:
             message['request_stat'] = 3
-            message['message'] += "title: %s|#|payload: %s|#|taskid: %s|,|" % (data[0]['value'][0]['data']['1']['title'], data[0]['value'][0]['data']['1']['payload'], taskid)
+            message['message'] += "title: %s|#|payload: %s|#|taskid: %s|,|" % (
+                data[0]['value'][0]['data']['1']['title'], data[0]['value'][0]['data']['1']['payload'], taskid)
     except Exception, e:
         print e
     finally:

@@ -1,5 +1,5 @@
 requests
 tornado
-redis
+pymongo
 scapy
 pcapy

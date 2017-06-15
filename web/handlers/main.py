@@ -5,26 +5,24 @@ import json
 import base64
 import urllib
 import threading
-
 import tornado.web
-
-from lib.redisopt import conn
 from lib import out
 from lib import scan
 from lib import secure
 from lib import config
 from lib import session
+from lib.enums import *
+from lib.mongo import ReqItem, conn
 from proxy import pyscapy, mix_proxy, proxy_io
 from web.handlers.base import BaseHandler, authenticated
 
-class PageNotFoundHandler(tornado.web.RequestHandler):
 
+class PageNotFoundHandler(tornado.web.RequestHandler):
     def get(self):
         return self.render("404.html")
 
 
 class LogoutHandler(BaseHandler):
-
     @authenticated
     def get(self):
         session.destroy(self.get_cookie("ysrc_token"))
@@ -34,7 +32,6 @@ class LogoutHandler(BaseHandler):
 
 
 class LoginHandler(tornado.web.RequestHandler):
-
     def get(self):
         return self.render("login.html")
 
@@ -55,33 +52,45 @@ class LoginHandler(tornado.web.RequestHandler):
 
 
 class IndexHandler(BaseHandler):
-
     @authenticated
     def get(self):
-        waiting = conn.lrange("waiting", 0, 15)
-        running = conn.lrange("running", 0, 15)
-        finished = conn.lrange("finished", 0, 15)
-        vulnerable = conn.lrange("vulnerable", 0, 15)
+        waiting = [each['hash'] for each in conn.find({'status': ITEM_STATUS.WAITING}, {'_id': 0, 'hash': 1})]
+        running = [each['hash'] for each in conn.find({'status': ITEM_STATUS.RUNNING}, {'_id': 0, 'hash': 1})]
+        finished = [each['hash'] for each in conn.find({'status': ITEM_STATUS.FINISHED}, {'_id': 0, 'hash': 1})]
+        vulnerable = [each['hash'] for each in conn.find({'vulnerable': 1}, {'_id': 0, 'hash': 1})]
+
         stats_all = {}
-        for i in [waiting, running, finished, vulnerable]:
-            for reqhash in i:
+        for each in [waiting, running, finished, vulnerable]:
+            for hash in each:
+                item = ReqItem(hash=hash)
                 try:
-                    decode_results = json.loads(base64.b64decode(conn.hget("results", reqhash)))
+                    stat = item.data_obj['response']['stat']
                 except:
-                    decode_results = {'stat':0}
+                    stat = 0
                 stats = ['success', 'info', 'warning', "danger"]
-                stat = decode_results['stat']
                 stat = stats[stat]
-                stats_all[reqhash] = stat
-        self.render("index.html", waiting_num=conn.llen("waiting"), running_num=conn.llen("running"), finished_num=conn.llen("finished"), vulnerable_num=conn.llen("vulnerable"), waiting=waiting, running=running, finished=finished, vulnerable=vulnerable, time=config.load()["flush_time"], stats_all=stats_all)
+                stats_all[hash] = stat
+
+        self.render(
+            "index.html",
+            waiting_num=len(waiting),
+            running_num=len(running),
+            finished_num=len(finished),
+            vulnerable_num=len(vulnerable),
+            waiting=waiting,
+            running=running,
+            finished=finished,
+            vulnerable=vulnerable,
+            time=config.load()["flush_time"],
+            stats_all=stats_all
+        )
         return
 
 
 class ConfHandler(BaseHandler):
-
     @authenticated
     def get(self):
-        return self.render("config.html", config = config.load())
+        return self.render("config.html", config=config.load())
 
     @authenticated
     def post(self):
@@ -96,7 +105,6 @@ class ConfHandler(BaseHandler):
 
 
 class ScanConfigHandler(BaseHandler):
-
     @authenticated
     def get(self):
         start = {}
@@ -110,7 +118,8 @@ class ScanConfigHandler(BaseHandler):
         rules = {}
         for i in rule:
             rules[i] = config.rule_read(i)
-        return self.render("scan_config.html", config=config.load(), start=start, rules=rules, scan_stat=config.load()['scan_stat'], sqlmap_api=config.load_rule()['sqlmap_api'])
+        return self.render("scan_config.html", config=config.load(), start=start, rules=rules,
+                           scan_stat=config.load()['scan_stat'], sqlmap_api=config.load_rule()['sqlmap_api'])
 
     @authenticated
     def post(self):
@@ -132,7 +141,6 @@ class ScanConfigHandler(BaseHandler):
 
 
 class ScanStatHandler(BaseHandler):
-
     @authenticated
     def get(self):
         stat = secure.clear(self.get_argument("stat"))
@@ -147,17 +155,17 @@ class ScanStatHandler(BaseHandler):
 
 
 class ReqHandler(BaseHandler):
-
     @authenticated
     def get(self):
         try:
             request_hash = self.get_argument("hash")
-            request = json.loads(base64.b64decode(conn.hget("request", request_hash)))
-            if not conn.hget("results", request_hash):
+            item = ReqItem(hash=request_hash)
+            request = item.data_obj['request']
+            if not item.data_obj['response']:
                 results = {}
                 stat = "success"
             else:
-                results = json.loads(base64.b64decode(conn.hget("results", request_hash)))
+                results = item.data_obj['response']
                 stat = results['stat']
                 stats = ['success', 'info', 'warning', "danger"]
                 stat = stats[stat]
@@ -175,63 +183,66 @@ class ReqHandler(BaseHandler):
                                 if message != "":
                                     messages.append(message)
                                 results[rule]['message'] = messages
-                #split the url in 80 chars
+                                # split the url in 80 chars
             url = request['url']
             request['url_encode'] = ""
-            for i in range(len(url)/80+1):
-                request['url_encode'] += url[i*80:i*80+80] + "\n"
+            for i in range(len(url) / 80 + 1):
+                request['url_encode'] += url[i * 80:i * 80 + 80] + "\n"
             return self.render("req.html", request=request, results=results, stat=stat)
         except Exception, e:
             out.error(str(e))
             return self.write(str(e))
 
 
-class ListHandler(BaseHandler):
-
-    @authenticated
-    def get(self):
-        list_type = self.get_argument("type")
-        try:
-            start = int(self.get_argument("start"))
-        except:
-            start = 0
-        page_num = int(config.load()['page_num'])
-        length = conn.llen(list_type)
-        last = start + page_num - 1
-        page_now = start / page_num + 1
-        end_page = -1 * ((-1 * length) / page_num)
-        end_num = end_page * page_num - page_num
-        if page_now - 2 >= 1:
-            pages_first = page_now - 2
-        else:
-            pages_first = 1
-        if page_now + 2 <= end_page:
-            pages_last = page_now + 2
-        else:
-            pages_last = end_page
-        pages = range(pages_first, pages_last + 1)
-        content = conn.lrange(list_type, start, last)
-        req_content = {}
-        for reqhash in content:
-            decode_content = json.loads(base64.b64decode(conn.hget("request", reqhash)))
-            try:
-                decode_results = json.loads(base64.b64decode(conn.hget("results", reqhash)))
-            except:
-                decode_results = {'stat': 0}
-            req_content[reqhash] = decode_content['method'] + "|" + decode_content['url']
-            #split the url in 80 chars
-            req_content[reqhash] += "|"
-            for i in range(len(req_content[reqhash].split("|")[1])/80+1):
-                req_content[reqhash] += req_content[reqhash].split("|")[1][i*80:i*80+80] + "\n"
-            stats = ['success', 'info', 'warning', "danger"]
-            stat = decode_results['stat']
-            stat = stats[stat]
-            req_content[reqhash] += "|" + stat
-        return self.render("list.html", page_now=page_now, page_num=page_num, pages=pages, content=content, list_type=list_type, length=length, req_content=req_content, end_num=end_num)
-
+# class ListHandler(BaseHandler):
+#     @authenticated
+#     def get(self):
+#         list_type = self.get_argument("type")
+#         try:
+#             start = int(self.get_argument("start"))
+#         except:
+#             start = 0
+#         page_num = int(config.load()['page_num'])
+#         length = ReqItem.status_count(list_type)
+#         last = start + page_num - 1
+#         page_now = start / page_num + 1
+#         end_page = -1 * ((-1 * length) / page_num)
+#         end_num = end_page * page_num - page_num
+#         if page_now - 2 >= 1:
+#             pages_first = page_now - 2
+#         else:
+#             pages_first = 1
+#         if page_now + 2 <= end_page:
+#             pages_last = page_now + 2
+#         else:
+#             pages_last = end_page
+#         pages = range(pages_first, pages_last + 1)
+#
+#         # TODO
+#         content = conn.lrange(list_type, start, last)
+#         req_content = {}
+#         for reqhash in content:
+#             # TODO
+#             decode_content = json.loads(base64.b64decode(conn.hget("request", reqhash)))
+#             try:
+#                 # TODO
+#                 decode_results = json.loads(base64.b64decode(conn.hget("results", reqhash)))
+#             except:
+#                 decode_results = {'stat': 0}
+#             req_content[reqhash] = decode_content['method'] + "|" + decode_content['url']
+#             # split the url in 80 chars
+#             req_content[reqhash] += "|"
+#             for i in range(len(req_content[reqhash].split("|")[1]) / 80 + 1):
+#                 req_content[reqhash] += req_content[reqhash].split("|")[1][i * 80:i * 80 + 80] + "\n"
+#             stats = ['success', 'info', 'warning', "danger"]
+#             stat = decode_results['stat']
+#             stat = stats[stat]
+#             req_content[reqhash] += "|" + stat
+#         return self.render("list.html", page_now=page_now, page_num=page_num, pages=pages, content=content,
+#                            list_type=list_type, length=length, req_content=req_content, end_num=end_num)
+#
 
 class ProxyHandler(BaseHandler):
-
     @authenticated
     def get(self):
         proxy_type = self.get_argument("type")
@@ -315,24 +326,28 @@ class ProxyHandler(BaseHandler):
 
 
 class DelHandler(BaseHandler):
-
     @authenticated
     def get(self):
+        """
+        清理数据
+        """
         del_type = self.get_argument("type")
-        if del_type in ['waiting', 'finished', 'running', 'vulnerable']:
-            conn.delete(del_type)
-        elif del_type == "flushdb":
-            conn.flushdb()
-            return self.write(out.jump("/"))
-        return self.write(out.jump("/list?type=" + del_type))
+        if del_type in [ITEM_STATUS.RUNNING, ITEM_STATUS.FINISHED, ITEM_STATUS.WAITING]:
+            ReqItem.delete(del_type)
+        elif del_type == "flushdb":  # 清空数据库
+            ReqItem.delete()
+        else:
+            pass  # TODO 用户提示
+        return self.write(out.jump("/"))
+
 
 class ResetScanHandler(BaseHandler):
-
     @authenticated
     def get(self):
+        """
+        将全部运行中的记录改为等待状态
+        """
         if config.load()['scan_stat'].lower() == 'false':
             return self.write(out.jump("/"))
-        stat = conn.rpoplpush("running", "waiting")
-        while stat:
-            stat = conn.rpoplpush("running", "waiting")
+        conn.update({"status": ITEM_STATUS.RUNNING}, {"$set": {"status": ITEM_STATUS.WAITING}})
         return self.write(out.alert("reset success!", "/scan_stat?stat=true"))

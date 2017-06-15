@@ -13,7 +13,7 @@ url_patterns =  [
     (r"^/scan_config", handlers.main.ScanConfigHandler),
     (r"^/scan_stat", handlers.main.ScanStatHandler),
     (r"^/req", handlers.main.ReqHandler),
-    (r"^/list", handlers.main.ListHandler),
+    # (r"^/list", handlers.main.ListHandler),
     (r"^/del", handlers.main.DelHandler),
     (r"^/reset_scan", handlers.main.ResetScanHandler),
     (r"^/.*", handlers.main.PageNotFoundHandler),
